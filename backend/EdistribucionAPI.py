@@ -1,19 +1,20 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+
 """
 Created on Wed May 20 11:42:56 2020
 
 @author: trocotronic
 """
 
-__VERSION__ = '0.4.1'
+__VERSION__ = '0.8.1'
 
-import requests, pickle, json, os, math
+import requests, pickle, json
 from bs4 import BeautifulSoup
-from urllib.parse import urlparse, unquote
+from urllib.parse import unquote
 import logging
 from datetime import datetime, timedelta
 from dateutil.tz import tzutc
+import credentials
+from pyjsparser import parse as jsparse
 
 UTC = tzutc()
 
@@ -32,6 +33,56 @@ class UrlError(EdisError):
         super().__init__(message)
     pass
 
+class EdistribucionMessageAction(object):
+    def __init__(self, id_: int, descriptor, callingDescriptor, params: dict):
+        self.id = id_
+        self.descriptor = descriptor
+        self.callingDescriptor = callingDescriptor
+        self.params = params
+        self._extras = {}
+
+    def __str__(self):
+        data = {
+            "id": self.id,
+            "descriptor": self.descriptor,
+            "callingDescriptor": self.callingDescriptor,
+            "params": self.params
+        }
+        if self._extras:
+            data.update(self._extras)
+        return json.dumps(data)
+
+    def add_field(self, key, value):
+        self._extras[key] = value
+
+    @property
+    def id(self):
+        return f"{self._id};a"
+
+    @id.setter
+    def id(self, value):
+        self._id = value
+
+    @property
+    def command(self):
+        return ".".join(self._descriptor.split("/ACTION$"))
+
+    @property
+    def descriptor(self):
+        return f"apex://{self._descriptor}"
+
+    @descriptor.setter
+    def descriptor(self, value):
+        self._descriptor = value
+
+    @property
+    def callingDescriptor(self):
+        return f"markup://c:{self._callingDescriptor}"
+
+    @callingDescriptor.setter
+    def callingDescriptor(self, value):
+        self._callingDescriptor = value
+
 def serialize_date(dt):
     """
     Serialize a date/time value into an ISO8601 text representation
@@ -43,7 +94,7 @@ def serialize_date(dt):
     """
     if dt.tzinfo:
         dt = dt.astimezone(UTC).replace(tzinfo=None)
-    return dt.isoformat() 
+    return dt.isoformat()
 
 class Edistribucion():
     __session = None
@@ -54,15 +105,14 @@ class Edistribucion():
     __dashboard = 'https://zonaprivada.edistribucion.com/areaprivada/s/sfsites/aura?'
     __command_index = 0
     __identities = {}
-    __appInfo = None
     __context = None
     __access_date = datetime.now()
-    
-    def __init__(self, user, password, debug_level=logging.INFO):
+
+    def __init__(self, login=None, password=None, debug_level=logging.INFO):
         self.__session = requests.Session()
-        self.__credentials['user'] = user
-        self.__credentials['password'] = password
-        
+        self.__credentials['user'] = login or credentials.username
+        self.__credentials['password'] = password or credentials.password
+
         try:
             with open(Edistribucion.SESSION_FILE, 'rb') as f:
                 self.__session.cookies.update(pickle.load(f))
@@ -77,9 +127,11 @@ class Edistribucion():
                 self.__access_date = datetime.fromisoformat(d['date'])
         except FileNotFoundError:
             logging.warning('Access file not found')
-        
+
         logging.getLogger().setLevel(debug_level)
-        
+
+        self.login()
+
     def __get_url(self, url,get=None,post=None,json=None,cookies=None,headers=None):
         __headers = {
             'User-Agent':'Mozilla/5.0 (Macintosh; Intel Mac OS X 10.14; rv:77.0) Gecko/20100101 Firefox/77.0',
@@ -93,8 +145,10 @@ class Edistribucion():
         logging.info('Sending %s request to %s', r.request.method, r.url)
         logging.debug('Parameters: %s', r.request.url)
         logging.debug('Headers: %s', r.request.headers)
+        logging.debug(f'Post data: {post}')
         logging.info('Response with code: %d', r.status_code)
         logging.debug('Headers: %s', r.headers)
+        logging.debug(f'Cookies: {r.cookies.get_dict()}')
         logging.debug('History: %s', r.history)
         if r.status_code >= 400:
             try:
@@ -112,24 +166,24 @@ class Edistribucion():
                 msg = "Error: status code {}".format(r.status_code)
             raise UrlError(r.status_code, msg, r)
         return r
-    
+
     def __command(self, command, post=None, dashboard=None, accept='*/*', content_type=None, recursive=False):
         if (not dashboard):
             dashboard = self.__dashboard
-        if (self.__command_index):
-            command = 'r='+self.__command_index+'&'
+        if (self.__command_index >= 0):
+            command = f'r={self.__command_index}&{command}'
             self.__command_index += 1
         logging.info('Preparing command: %s', command)
         if (post):
             post['aura.context'] = self.__context
-            post['aura.pageURI'] = '/areaprivada/s/wp-online-access'
+            post['aura.pageURI'] = '/areaprivada/s/'
             post['aura.token'] = self.__token
             logging.debug('POST data: %s', post)
         logging.debug('Dashboard: %s', dashboard)
         if (accept):
             logging.debug('Accept: %s', accept)
         if (content_type):
-            logging.debug('Content-tpye: %s', content_type)
+            logging.debug('Content-type: %s', content_type)
             '''
         try:
             if (not self.__check_tokens()):
@@ -146,18 +200,26 @@ class Edistribucion():
         if ('window.location.href' in r.text or 'clientOutOfSync' in r.text):
             if (not recursive):
                 logging.info('Redirection received. Fetching credentials again.')
-                
+
                 self.__session = requests.Session()
                 self.__force_login()
                 self.__command(command=command, post=post, dashboard=dashboard, accept=accept, content_type=content_type, recursive=True)
             else:
                 logging.warning('Redirection received twice. Aborting command.')
         if ('json' in r.headers['Content-Type']):
+            if ('Invalid token' in r.text):
+                if (not recursive):
+                    self.__session = requests.Session()
+                    #self.__force_login()
+                    self.__token = self.__get_token()
+                    self.__command(command=command, post=post, dashboard=dashboard, accept=accept, content_type=content_type, recursive=True)
+                else:
+                    logging.warning('Token expired. Cannot refresh')
             jr = r.json()
             if (jr['actions'][0]['state'] != 'SUCCESS'):
                 if (not recursive):
                     logging.info('Error received. Fetching credentials again.')
-                    
+
                     self.__session = requests.Session()
                     self.__force_login()
                     self.__command(command=command, post=post, dashboard=dashboard, accept=accept, content_type=content_type, recursive=True)
@@ -166,11 +228,11 @@ class Edistribucion():
                     raise EdisError('Error processing command: {}'.format(jr['actions'][0]['error'][0]['message']))
             return jr['actions'][0]['returnValue']
         return r
-    
+
     def __check_tokens(self):
         logging.debug('Checking tokens')
         return self.__token != 'undefined' and self.__access_date+timedelta(minutes=10) > datetime.now()
-        
+
     def __save_access(self):
         t = {}
         t['token'] = self.__token
@@ -180,44 +242,84 @@ class Edistribucion():
         with open(Edistribucion.ACCESS_FILE, 'w') as f:
             json.dump(t, f, default=serialize_date)
         logging.info('Saving access to file')
-        
+
     def login(self):
         logging.info('Loging')
         if (not self.__check_tokens()):
             self.__session = requests.Session()
             return self.__force_login()
         return True
-    
-    def __force_login(self, recursive=False):
-        logging.warning('Forcing login')
-        r = self.__get_url('https://zonaprivada.edistribucion.com/areaprivada/s/login?ec=302&startURL=%2Fareaprivada%2Fs%2F')
-        ix = r.text.find('auraConfig')
-        if (ix == -1):
-            raise EdisError('auraConfig not found. Cannot continue')
-        
+
+    def __get_token(self):
+        r = self.__get_url('https://zonaprivada.edistribucion.com/areaprivada/s/')
+        self.__update_context(r.text)
         soup = BeautifulSoup(r.text, 'html.parser')
+        scripts = soup.find_all('script')
+        logging.info('Loading token scripts')
+        for s in scripts:
+            if (s.string and 'auraConfig' in s.string):
+                prsr = jsparse(s.string)
+                for b in prsr['body']:
+                    decls = b.get('expression', {}).get('callee', {}).get('body', {}).get('body', [])
+                    for d in decls:
+                        if (d.get('type', None) == 'VariableDeclaration'):
+                            for dc in d.get('declarations', []):
+                                if (dc.get('id', {}).get('name', None) == 'auraConfig'):
+                                    for prop in dc.get('init', {}).get('properties', []):
+                                        if (prop.get('key', {}).get('value', None) == 'eikoocnekot'):
+                                            cookie_var = prop.get('value', {}).get('value', None)
+                                            ret = self.__session.cookies.get_dict().get(cookie_var, None)
+                                            del self.__session.cookies[cookie_var]
+                                            return ret
+        return None
+
+    def __update_context(self, text):
+        soup = BeautifulSoup(text, 'html.parser')
         scripts = soup.find_all('script')
         logging.info('Loading scripts')
         for s in scripts:
             src = s.get('src')
             if (not src):
                 continue
-            print(s)
-            upr = urlparse(r.url)
-            r = self.__get_url(upr.scheme+'://'+upr.netloc+src)
             if ('resources.js' in src):
                 unq = unquote(src)
-                self.__context = unq[unq.find('{'):unq.rindex('}')+1]
-                self.__appInfo = json.loads(self.__context)
+                try:
+                    path = unq[unq.find('{'):unq.rindex('}')+1]
+                    j = json.loads(path)
+                    self.__context = f'{{"mode":"{j["mode"]}","fwuid":"{j["fwuid"]}","app":"{j["app"]}","loaded":{json.dumps(j["loaded"]).replace(" ","")},"dn":[],"globals":{{}},"uad":false}}'
+                except Exception:
+                    raise EdisError('Cannot obtain context')
+
+    def __force_login(self, recursive=False):
+        logging.warning('Forcing login')
+        r = self.__get_url('https://zonaprivada.edistribucion.com/areaprivada/s/login?ec=302&startURL=%2Fareaprivada%2Fs%2F')
+        ix = r.text.find('auraConfig')
+        if (ix == -1):
+            raise EdisError('auraConfig not found. Cannot continue')
+
+        self.__update_context(r.text)
         logging.info('Performing login routine')
+
+        params = {
+            "username": self.__credentials['user'],
+            "password": self.__credentials['password'],
+            "startUrl": "/areaprivada/s/"
+        }
+        action = EdistribucionMessageAction(
+            91,
+            "LightningLoginFormController/ACTION$login",
+            "WP_LoginForm",
+            params
+        )
+
         data = {
-                'message':'{"actions":[{"id":"91;a","descriptor":"apex://LightningLoginFormController/ACTION$login","callingDescriptor":"markup://c:WP_LoginForm","params":{"username":"'+self.__credentials['user']+'","password":"'+self.__credentials['password']+'","startUrl":"/areaprivada/s/"}}]}',
+                'message': '{"actions":[' + str(action) + ']}',
                 'aura.context':self.__context,
                 'aura.pageURI':'/areaprivada/s/login/?language=es&startURL=%2Fareaprivada%2Fs%2F&ec=302',
                 'aura.token':'undefined',
                 }
-        r = self.__get_url(self.__dashboard+'other.LightningLoginForm.login=1',post=data)
-        print(r.text)
+        r = self.__get_url(self.__dashboard+'r=1&other.LightningLoginForm.login=1',post=data)
+        #print(r.text)
         if ('/*ERROR*/' in r.text):
             if ('invalidSession' in r.text and not recursive):
                 self.__session = requests.Session()
@@ -229,16 +331,9 @@ class Edistribucion():
         logging.info('Accessing to frontdoor')
         r = self.__get_url(jr['events'][0]['attributes']['values']['url'])
         logging.info('Accessing to landing page')
-        r = self.__get_url('https://zonaprivada.edistribucion.com/areaprivada/s/')
-        ix = r.text.find('auraConfig')
-        if (ix == -1):
-            raise EdisError('auraConfig not found. Cannot continue')
-        ix = r.text.find('{',ix)
-        ed = r.text.find(';',ix)
-        jr = json.loads(r.text[ix:ed])
-        if ('token' not in jr):
+        self.__token = self.__get_token()
+        if (not self.__token):
             raise EdisError('token not found. Cannot continue')
-        self.__token = jr['token']
         logging.info('Token received!')
         logging.debug(self.__token)
         logging.info('Retreiving account info')
@@ -251,86 +346,127 @@ class Edistribucion():
             pickle.dump(self.__session.cookies, f)
         logging.debug('Saving session')
         self.__save_access()
-            
+
+    def __run_action_command(self, action, command=None):
+        data = {'message': '{"actions":[' + str(action) + ']}'}
+        if not command:
+            command = action.command
+        req = self.__command(f"other.{command}=1", post=data)
+        return req
+
     def get_login_info(self):
-        data = {
-            'message': '{"actions":[{"id":"215;a","descriptor":"apex://WP_Monitor_CTRL/ACTION$getLoginInfo","callingDescriptor":"markup://c:WP_Monitor","params":{"serviceNumber":"S011"}}]}',
-            }
-        r = self.__command('other.WP_Monitor_CTRL.getLoginInfo=1', post=data)
-        return r
-        
-    def get_cups(self):
-        data = {
-            'message': '{"actions":[{"id":"270;a","descriptor":"apex://WP_ContadorICP_F2_CTRL/ACTION$getCUPSReconectarICP","callingDescriptor":"markup://c:WP_Reconnect_ICP","params":{"visSelected":"'+self.__identities['account_id']+'"}}]}',
-            }
-        r = self.__command('other.WP_ContadorICP_F2_CTRL.getCUPSReconectarICP=1', post=data)
-        return r
-    
-    def get_cups_info(self, cups):
-        data = {
-            'message': '{"actions":[{"id":"489;a","descriptor":"apex://WP_ContadorICP_F2_CTRL/ACTION$getCupsInfo","callingDescriptor":"markup://c:WP_Reconnect_Detail","params":{"cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_ContadorICP_F2_CTRL.getCupsInfo=1', post=data)
-        return r
-    
+        action = EdistribucionMessageAction(
+            215,
+            "WP_Monitor_CTRL/ACTION$getLoginInfo",
+            "WP_Monitor",
+            {"serviceNumber": "S011"}
+        )
+        return self.__run_action_command(action)
+
+    def get_identities(self):
+        ids = self.get_login_info()
+        return ids.get('authList',[])
+
+    def get_cups(self, vis=None):
+        action = EdistribucionMessageAction(
+            270,
+            "WP_ContadorICP_F2_CTRL/ACTION$getCUPSReconectarICP",
+            "WP_Reconnect_ICP",
+            {"visSelected": vis or self.__identities['account_id']}
+        )
+        return self.__run_action_command(action)
+
+    def get_cups_info(self, cups, vis=None):
+        action = EdistribucionMessageAction(
+            489,
+            "WP_ContadorICP_F2_CTRL/ACTION$getCupsInfo",
+            "WP_Reconnect_Detail_F2",
+            {"cupsId": cups, "visSelected": vis or self.__identities['account_id']}
+        )
+        return self.__run_action_command(action)
+
     def get_meter(self, cups):
-        data = {
-            'message': '{"actions":[{"id":"522;a","descriptor":"apex://WP_ContadorICP_F2_CTRL/ACTION$consultarContador","callingDescriptor":"markup://c:WP_Reconnect_Detail","params":{"cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_ContadorICP_F2_CTRL.consultarContador=1', post=data)
-        return r
-    
-    def get_all_cups(self):
-        data = {
-            'message': '{"actions":[{"id":"294;a","descriptor":"apex://WP_ConsultaSuministros/ACTION$getAllCUPS","callingDescriptor":"markup://c:WP_MySuppliesForm","params":{"visSelected":"'+self.__identities['account_id']+'"}}]}',
-            }
-        r = self.__command('other.WP_ConsultaSuministros.getAllCUPS=1', post=data)
-        return r
-    
-    def get_cups_detail(self, cups):
-        data = {
-            'message': '{"actions":[{"id":"490;a","descriptor":"apex://WP_CUPSDetail_CTRL/ACTION$getCUPSDetail","callingDescriptor":"markup://c:WP_cupsDetail","params":{"visSelected":"'+self.__identities['account_id']+'","cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_CUPSDetail_CTRL.getCUPSDetail=1', post=data)
-        return r
-    
+        action = EdistribucionMessageAction(
+            522,
+            "WP_ContadorICP_F2_CTRL/ACTION$consultarContador",
+            "WP_Reconnect_Detail",
+            {"cupsId": cups}
+        )
+        return self.__run_action_command(action)
+
+    def get_all_cups(self, vis=None):
+        action = EdistribucionMessageAction(
+            294,
+            "WP_ConsultaSuministros/ACTION$getAllCUPS",
+            "WP_MySuppliesForm",
+            {"visSelected": vis or self.__identities['account_id']}
+        )
+        return self.__run_action_command(action)
+
+    def get_cups_detail(self, cups, vis=None):
+        action = EdistribucionMessageAction(
+            490,
+            "WP_CUPSDetail_CTRL/ACTION$getCUPSDetail",
+            "WP_cupsDetail",
+            {"visSelected": vis or self.__identities['account_id'], "cupsId": cups}
+        )
+        return self.__run_action_command(action)
+
     def get_cups_status(self, cups):
-        data = {
-            'message': '{"actions":[{"id":"629;a","descriptor":"apex://WP_CUPSDetail_CTRL/ACTION$getStatus","callingDescriptor":"markup://c:WP_cupsDetail","params":{"cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_CUPSDetail_CTRL.getStatus=1', post=data)
-        return r
-    
+        action = EdistribucionMessageAction(
+            629,
+            "WP_CUPSDetail_CTRL/ACTION$getStatus",
+            "WP_cupsDetail",
+            {"cupsId": cups}
+        )
+        return self.__run_action_command(action)
+
     def get_atr_detail(self, atr):
-        data = {
-            'message': '{"actions":[{"id":"62;a","descriptor":"apex://WP_ContractATRDetail_CTRL/ACTION$getATRDetail","callingDescriptor":"markup://c:WP_SuppliesATRDetailForm","params":{"atrId":"'+atr+'"}}]}',
-            }
-        r = self.__command('other.WP_ContractATRDetail_CTRL.getATRDetail=1', post=data)
-        return r
-    
+        action = EdistribucionMessageAction(
+            62,
+            "WP_ContractATRDetail_CTRL/ACTION$getATRDetail",
+            "WP_SuppliesATRDetailForm",
+            {"atrId": atr}
+        )
+        return self.__run_action_command(action)
+
     def get_solicitud_atr_detail(self, sol):
-        data = {
-            'message': '{"actions":[{"id":"56;a","descriptor":"apex://WP_SolicitudATRDetail_CTRL/ACTION$getSolicitudATRDetail","callingDescriptor":"markup://c:WP_ATR_Requests_Detail_Form","params":{"solId":"'+sol+'"}}]}',
-            }
-        r = self.__command('other.WP_SolicitudATRDetail_CTRL.getSolicitudATRDetail=1', post=data)
-        return r
-    
+        action = EdistribucionMessageAction(
+            56,
+            "WP_SolicitudATRDetail_CTRL/ACTION$getSolicitudATRDetail",
+            "WP_ATR_Requests_Detail_Form",
+            {"solId": sol}
+        )
+        return self.__run_action_command(action)
+
     def reconnect_ICP(self, cups):
-        data = {
-            'message': '{"actions":[{"id":"261;a","descriptor":"apex://WP_ContadorICP_F2_CTRL/ACTION$reconectarICP","callingDescriptor":"markup://c:WP_Reconnect_Detail_F2","params":{"cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_ContadorICP_F2_CTRL.reconectarICP=1', post=data)
-        data = {
-            'message': '{"actions":[{"id":"287;a","descriptor":"apex://WP_ContadorICP_F2_CTRL/ACTION$goToReconectarICP","callingDescriptor":"markup://c:WP_Reconnect_Modal","params":{"cupsId":"'+cups+'"}}]}',
-            }
-        r = self.__command('other.WP_ContadorICP_F2_CTRL.goToReconectarICP=1', post=data)
+        action = EdistribucionMessageAction(
+            261,
+            "WP_ContadorICP_F2_CTRL/ACTION$reconectarICP",
+            "WP_Reconnect_Detail_F2",
+            {"cupsId": cups}
+        )
+        r = self.__run_action_command(action)
+        # -----
+        action = EdistribucionMessageAction(
+            287,
+            "WP_ContadorICP_F2_CTRL/ACTION$goToReconectarICP",
+            "WP_Reconnect_Modal",
+            {"cupsId": cups}
+        )
+        r = self.__run_action_command(action)
+
         return r
-    
-    def get_list_cups(self):
-        data = {
-            'message': '{"actions":[{"id":"1086;a","descriptor":"apex://WP_Measure_v3_CTRL/ACTION$getListCups","callingDescriptor":"markup://c:WP_Measure_List_v4","params":{"sIdentificador":"'+self.__identities['account_id']+'"}}]}',
-            }
-        r = self.__command('other.WP_Measure_v3_CTRL.getListCups=1', post=data)
+
+    def get_list_cups(self, vis=None):
+        action = EdistribucionMessageAction(
+            1086,
+            "WP_Measure_v3_CTRL/ACTION$getListCups",
+            "WP_Measure_List_v4",
+            {"sIdentificador": vis or self.__identities['account_id']}
+        )
+        r = self.__run_action_command(action)
+
         conts = []
         for cont in r['data']['lstCups']:
             if (cont['Id'] in r['data']['lstIds']):
@@ -345,17 +481,36 @@ class Edistribucion():
         return conts
 
     def get_list_cycles(self, cont):
-        data = {
-            'message': '{"actions":[{"id":"1190;a","descriptor":"apex://WP_Measure_v3_CTRL/ACTION$getInfo","callingDescriptor":"markup://c:WP_Measure_Detail_v4","params":{"contId":"'+cont['Id']+'"},"longRunning":true}]}',
-            }
-        r = self.__command('other.WP_Measure_v3_CTRL.getInfo=1', post=data)
+        action = EdistribucionMessageAction(
+            1190,
+            "WP_Measure_v3_CTRL/ACTION$getInfo",
+            "WP_Measure_Detail_v4",
+            {"contId": cont}
+        )
+        action.add_field("longRunning", True)
+
+        r = self.__run_action_command(action)
         return r['data']['lstCycles']
-        
-      
+
     def get_meas(self, cont, cycle):
-        data = {
-            'message': '{"actions":[{"id":"1295;a","descriptor":"apex://WP_Measure_v3_CTRL/ACTION$getChartPoints","callingDescriptor":"markup://c:WP_Measure_Detail_v4","params":{"cupsId":"'+cont['Id']+'","dateRange":"'+cycle['label']+'","cfactura":"'+cycle['value']+'"},"longRunning":true}]}',
-            }
-        r = self.__command('other.WP_Measure_v3_CTRL.getChartPoints=1', post=data)
+        action = EdistribucionMessageAction(
+            1295,
+            "WP_Measure_v3_CTRL/ACTION$getChartPoints",
+            "WP_Measure_Detail_v4",
+            {"cupsId": cont, "dateRange": cycle['label'], "cfactura": cycle['value']}
+        )
+        action.add_field("longRunning", True)
+
+        r = self.__run_action_command(action)
         return r['data']['lstData']
-    
+
+    def get_meas_interval(self, cont, startDate, endDate):
+        action = EdistribucionMessageAction(
+            1362,
+            "WP_Measure_v3_CTRL/ACTION$getChartPointsByRange",
+            "WP_Measure_Detail_Filter_Advanced_v3",
+            {"contId": cont, "type": 4, "startDate": startDate, "endDate": endDate}
+        )
+
+        r = self.__run_action_command(action)
+        return r['data']['lstData']
